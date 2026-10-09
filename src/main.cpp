@@ -4,9 +4,12 @@
 #include <WiFi.h>
 
 #include "DFRobot_AI10.h"
+#include "guardian_x/admin_credential_storage.h"
 #include "guardian_x/device_core.h"
+#include "guardian_x/esp_security_adapters.h"
 #include "guardian_x/littlefs_storage.h"
 #include "guardian_x/provisioning.h"
+#include "guardian_x/security.h"
 
 namespace {
 
@@ -39,6 +42,11 @@ U8G2_SSD1309_128X64_NONAME0_F_4W_HW_SPI oled(
 guardian_x::LittleFsStorage deviceStorage;
 guardian_x::DeviceCore deviceCore(deviceStorage);
 guardian_x::ProvisioningService provisioningService(deviceCore);
+guardian_x::AdminCredentialStorage adminCredentialStorage;
+guardian_x::EspSecureRandom secureRandom;
+guardian_x::MillisTimeSource timeSource;
+guardian_x::SecurityCore securityCore(adminCredentialStorage, secureRandom,
+                                      timeSource);
 
 enum class WifiConnectionPhase : uint8_t {
   kIdle,
@@ -89,7 +97,7 @@ void initializeOled() {
   }
 
   oled.setContrast(255);
-  drawStatus("BOOTING", "GUARDIAN X", "PHASE 3");
+  drawStatus("BOOTING", "GUARDIAN X", "PHASE 4");
   Serial.println(F("OLED: ready"));
 }
 
@@ -106,13 +114,19 @@ void initializeSensor() {
 
 void printHelp() {
   Serial.println();
-  Serial.println(F("GUARDIAN X Phase 3 serial commands:"));
+  Serial.println(F("GUARDIAN X Phase 4 serial commands:"));
   Serial.println(F("  l              List registered SEN0677 user IDs"));
   Serial.println(F("  e <name>       Enroll a palm with the given test name"));
   Serial.println(F("  r              Recognize one presented palm"));
   Serial.println(F("  d <uid>        Delete a registered SEN0677 user ID"));
-  Serial.println(F("  f              Factory reset (clear network configuration)"));
+  Serial.println(F("  a <user> <pw>  Initialize the administrator account (first time only)"));
+  Serial.println(F("  login <u> <p>  Verify administrator credentials (creates a session)"));
+  Serial.println(F("  logout         Invalidate all administrator sessions"));
+  Serial.println(F("  s              Security status (account and active sessions)"));
+  Serial.println(F("  f              Factory reset: network config + administrator credentials"));
+  Serial.println(F("  A              Admin recovery: erase the credential record ONLY"));
   Serial.println(F("  h              Show this help"));
+  Serial.println();
 }
 
 bool requireSensorReady() {
@@ -314,10 +328,114 @@ void factoryReset() {
     return;
   }
 
-  Serial.println(F("Factory reset complete. Restarting…"));
-  drawStatus("FACTORY RESET", "COMPLETE", "Restarting…");
+  // Phase 4: factory reset also erases the administrator credential record.
+  // Application data (classes, students, guardians, palms, dismissal records)
+  // is preserved.  Use 'A' to reset only the administrator credentials.
+  const guardian_x::SecurityResult adminResult =
+      securityCore.resetAdminCredentials();
+  if (adminResult != guardian_x::SecurityResult::kOk) {
+    Serial.print(F("Factory reset: credential erase failed: "));
+    Serial.println(guardian_x::securityResultText(adminResult));
+    Serial.println(F("Network configuration was cleared; administrator credentials may remain."));
+    drawStatus("RESET PARTIAL", "CREDENTIAL ERROR", "Restarting…");
+  } else {
+    securityCore.begin();
+    Serial.println(F("Factory reset complete. Restarting…"));
+    drawStatus("FACTORY RESET", "COMPLETE", "Restarting…");
+  }
+
   delay(1000);
   ESP.restart();
+}
+
+bool splitUsernameAndPassword(const String &argument, String *username,
+                              String *password) {
+  String remainder = argument;
+  while (remainder.length() > 0 && remainder.charAt(0) == ' ') {
+    remainder.remove(0, 1);
+  }
+  const int separator = remainder.indexOf(' ');
+  if (separator < 0) {
+    *username = remainder;
+    *password = "";
+  } else {
+    *username = remainder.substring(0, separator);
+    *password = remainder.substring(separator + 1);
+  }
+  return username->length() > 0 && password->length() > 0;
+}
+
+void initializeAdmin(const String &argument) {
+  String username;
+  String password;
+  if (!splitUsernameAndPassword(argument, &username, &password)) {
+    Serial.println(F("Usage: a <username> <password>"));
+    return;
+  }
+
+  const guardian_x::SecurityResult result =
+      securityCore.initializeAdmin(username.c_str(), password.c_str());
+  Serial.print(F("Administrator initialization: "));
+  Serial.println(guardian_x::securityResultText(result));
+  if (result == guardian_x::SecurityResult::kOk) {
+    Serial.println(F("Passwords are never stored or logged; only a salted PBKDF2 verifier is persisted."));
+  }
+}
+
+void handleLogin(const String &argument) {
+  String username;
+  String password;
+  if (!splitUsernameAndPassword(argument, &username, &password)) {
+    Serial.println(F("Usage: login <username> <password>"));
+    return;
+  }
+
+  uint8_t token[guardian_x::kSessionTokenLength];
+  const guardian_x::SecurityResult result =
+      securityCore.authenticate(username.c_str(), password.c_str(), token);
+  // The token is deliberately discarded and never printed; this serial flow
+  // verifies credentials and exercises the session path on real hardware.
+  if (result == guardian_x::SecurityResult::kOk) {
+    Serial.println(F("Login successful; a 30-minute session was created."));
+  } else {
+    Serial.print(F("Login failed: "));
+    Serial.println(guardian_x::securityResultText(result));
+  }
+}
+
+void handleLogout() {
+  const guardian_x::SecurityResult result = securityCore.logoutAll();
+  Serial.print(F("Logout: "));
+  Serial.println(guardian_x::securityResultText(result));
+}
+
+void showSecurityStatus() {
+  if (!securityCore.ready()) {
+    Serial.println(F("Security core: not ready (see boot log)."));
+    return;
+  }
+  Serial.print(F("Administrator account: "));
+  Serial.println(securityCore.isAdminInitialized() ? F("initialized")
+                                                   : F("not initialized"));
+  Serial.print(F("Active sessions: "));
+  Serial.print(securityCore.activeSessionCount());
+  Serial.print('/');
+  Serial.println(guardian_x::SecurityCore::sessionCapacity());
+}
+
+void resetAdminCredentials() {
+  Serial.println(F("Admin recovery: erasing the credential record only."));
+  const guardian_x::SecurityResult result =
+      securityCore.resetAdminCredentials();
+  if (result != guardian_x::SecurityResult::kOk) {
+    Serial.print(F("Admin recovery failed: "));
+    Serial.println(guardian_x::securityResultText(result));
+    return;
+  }
+  const guardian_x::SecurityResult beginResult = securityCore.begin();
+  Serial.print(F("Admin recovery complete. Security core: "));
+  Serial.println(guardian_x::securityResultText(beginResult));
+  Serial.println(F("Classes, students, guardians, palms and dismissal records are untouched."));
 }
 
 void handleSerialCommand() {
@@ -326,16 +444,34 @@ void handleSerialCommand() {
   }
 
   String line = Serial.readStringUntil('\n');
-  line.trim();
+  if (line.endsWith("\r")) {
+    line.remove(line.length() - 1);
+  }
   if (line.length() == 0) {
     return;
   }
 
-  const char command = tolower(line.charAt(0));
+  const char command = line.charAt(0);
+
+  // 'A' is deliberately case-sensitive so the recovery wipe is never
+  // triggered by a mistyped 'a'.
+  if (command == 'A') {
+    resetAdminCredentials();
+    return;
+  }
+  if (line.startsWith("login ") || line.equals("login")) {
+    handleLogin(line.substring(5));
+    return;
+  }
+  if (line.equals("logout")) {
+    handleLogout();
+    return;
+  }
+
   String argument = line.substring(1);
   argument.trim();
 
-  switch (command) {
+  switch (tolower(command)) {
     case 'l':
       listUsers();
       break;
@@ -350,6 +486,12 @@ void handleSerialCommand() {
       break;
     case 'f':
       factoryReset();
+      break;
+    case 'a':
+      initializeAdmin(line.substring(1));
+      break;
+    case 's':
+      showSecurityStatus();
       break;
     case 'h':
     case '?':
@@ -428,7 +570,7 @@ void setup() {
   Serial.println();
   Serial.println("========================================");
   Serial.println("GUARDIAN X");
-  Serial.println("PHASE 3 - DEVICE PROVISIONING");
+  Serial.println("PHASE 4 - AUTHENTICATION & SECURITY");
   Serial.println("========================================");
   Serial.println(F("ESP32-S3 firmware booted."));
 
@@ -465,6 +607,23 @@ void setup() {
   Serial.print(F("Device core: "));
   Serial.println(guardian_x::coreResultText(coreResult));
 
+  Serial.println(F("Initializing security core…"));
+  if (!adminCredentialStorage.begin()) {
+    Serial.println(F("Admin credential storage: mount failed; administrator setup is unavailable."));
+  } else {
+    const guardian_x::SecurityResult securityResult = securityCore.begin();
+    Serial.print(F("Security core: "));
+    Serial.println(guardian_x::securityResultText(securityResult));
+    if (securityResult == guardian_x::SecurityResult::kCorruptRecord) {
+      Serial.println(F("Credential record is unreadable. Serial command A erases it (application data is preserved)."));
+    }
+    if (securityCore.isAdminInitialized()) {
+      Serial.println(F("Administrator account: initialized."));
+    } else {
+      Serial.println(F("Administrator account: not initialized. Use 'a <username> <password>' on this serial console only."));
+    }
+  }
+
   if (coreResult != guardian_x::CoreResult::kOk) {
     Serial.println(F("Local data changes are disabled; hardware diagnostics remain available."));
     if (oledReady) {
@@ -497,6 +656,10 @@ void setup() {
 
 void loop() {
   handleSerialCommand();
+
+  if (securityCore.ready()) {
+    securityCore.expireSessions();
+  }
 
   if (provisioningService.isActive()) {
     provisioningService.update();

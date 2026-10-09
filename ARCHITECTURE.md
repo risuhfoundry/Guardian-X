@@ -36,11 +36,31 @@ resort. Wi-Fi credentials are stored only in the snapshot (the Wi-Fi
 library's NVS credential cache is disabled) and are never logged. Hardware
 validation has **not yet been performed**.
 
-**PLANNED:** Authentication, the local API/HTTP server, application workflow,
-and web UI components below remain target architecture only. The device does
-not authenticate users or run a dismissal workflow. The Phase 3 setup page is
-a single-purpose provisioning interface — it is not the Phase 5 API or the
-Phase 6 web UI.
+**IMPLEMENTED IN PHASE 4:** Authentication and security. A hardware-
+independent `SecurityCore` provides first-time administrator initialization,
+PBKDF2-HMAC-SHA256 password hashing (100,000 iterations, 16-byte random salt,
+32-byte output, via the ESP-IDF mbedTLS already present in the framework),
+constant-time verification, in-memory sessions (256-bit hardware-RNG tokens,
+4 slots, 30-minute lifetime, evict-oldest at capacity), logout and
+logout-all, and a reusable fail-closed `authorize()` check that returns a
+minimal `Principal`. The credential verifier (magic `GXA1`, format version,
+iterations, salt, hash, username, CRC32) is stored in its own LittleFS file
+`/guardian-x-admin.bin` written atomically via temporary-file-plus-rename —
+deliberately outside the DeviceCore snapshot so slot-level snapshot recovery
+cannot erase credentials and credential recovery cannot destroy application
+data. A full LittleFS reformat still erases both, and requires administrator
+initialization again. Admin setup and recovery run only over the physical
+serial console (`a` initialize, `A` erase credentials); the open setup AP
+cannot touch credentials. The `f` factory reset now clears network state and credentials
+while preserving all Phase 2 application data. Sessions are memory-only, so
+a reboot invalidates them all. Passwords, hashes, and session tokens are
+never logged or persisted in plaintext. No HTTP API exists yet; the
+authorization boundary is what Phase 5 routes will call.
+
+**PLANNED:** The local API/HTTP server, application workflow, and web UI
+components below remain target architecture only. The device does not run a
+dismissal workflow. The Phase 3 setup page is a single-purpose provisioning
+interface — it is not the Phase 5 API or the Phase 6 web UI.
 
 ## Target architecture
 
@@ -68,17 +88,19 @@ Phase 6 web UI.
            Web UI             Dismissal Engine
 ```
 
-This is the target architecture. Phases 0–2 establish the project, hardware
-foundation, and local core from which later phases can implement and validate
-the remaining layers.
+This is the target architecture. Phases 0–4 establish the project, hardware
+foundation, local core, provisioning, and authentication/security layers from
+which later phases can implement and validate the remaining layers.
 
 ## Future hardware pin reference
 
 These pins are implemented for the Phase 1 hardware foundation. Phase 2 local
 storage and data models add no hardware wiring. Phase 3 uses the ESP32-S3 radio
 (setup AP when unprovisioned, station mode when provisioned) and adds no wired
-peripherals or pin changes. No authentication or application workflow exists
-yet.
+peripherals or pin changes. Phase 4 adds no hardware: authentication uses the
+existing serial console as its physical trust anchor and the ESP32-S3 hardware
+random generator for salts and session tokens. No application workflow or HTTP
+API exists yet.
 
 | Peripheral | Signal | ESP32-S3 mapping |
 | --- | --- | --- |
@@ -93,19 +115,27 @@ yet.
 
 Specifically, ESP32 GPIO17 transmits to the SEN0677 RX pin, and ESP32 GPIO16 receives from the SEN0677 TX pin. Phase 1 uses this UART and the documented SSD1309 SPI pins only.
 
-## Planned layers
+## Layered responsibilities
+
+Layers 1–3 are implemented by Phases 0–4; layers 4–7 remain planned for later
+validated phases.
 
 ### 1. Hardware Layer
 
-Responsibilities: SEN0677, SSD1309, GPIO, UART, and SPI.
+Responsibilities: SEN0677, SSD1309, GPIO, UART, and SPI. **Implemented**
+(Phases 0–1).
 
 ### 2. Storage Layer
 
-Responsibilities: persistent device configuration, local application data, data versioning, and recovery.
+Responsibilities: persistent device configuration, local application data, data versioning, and recovery. **Implemented** (Phase 2).
 
 ### 3. Authentication Layer
 
-Responsibilities: admin authentication, password hashing, session management, and authorization.
+Responsibilities: admin authentication, password hashing, session management, and authorization. **Implemented** (Phase 4): the `SecurityCore` provides
+first-time administrator initialization, PBKDF2-HMAC-SHA256 password
+verifiers, in-memory sessions with bounded capacity and expiry, and reusable
+fail-closed authorization checks; see the scope status at the top of this
+document.
 
 ### 4. API Layer
 

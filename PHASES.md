@@ -107,6 +107,88 @@ ESP32-S3.
 - **Expected output:** Authenticated, authorized local administration.
 - **Completion criteria:** Security flows and protected-route tests pass, including invalid and expired session cases.
 
+**Implemented scope:** Phase 4 adds a hardware-independent `SecurityCore`
+(`guardian_x/security.h`) plus a LittleFS credential store and ESP32 adapters,
+without implementing Phase 5's general HTTP API (the "protected APIs" above
+are represented only by the reusable authorization boundary; see below).
+
+- **Administrator initialization.** First-time setup happens only over the
+  physical serial console (`a <username> <password>`), never through the
+  open Phase 3 setup AP. There is no hardcoded default password and no
+  credential material in source. Usernames (1–32 printable characters, no
+  spaces) and passwords (8–64 printable characters) are validated before
+  anything is persisted. Re-initializing an already-initialized device is
+  rejected and never silently replaces the stored credential. A storage
+  failure during initialization is reported as `kStoreFailure` and leaves the
+  device uninitialized — success is only reported after the credential record
+  is durably written.
+- **Password hashing.** Passwords are hashed with PBKDF2-HMAC-SHA256 using
+  the mbedTLS implementation already provided by the ESP-IDF framework
+  (2.28.x; no new device dependency and no custom cryptography): 100,000
+  iterations, a 16-byte random salt, and a 32-byte output. Every credential
+  generation — including each password change — draws a fresh salt, and the
+  record stores the iteration count and format version so parameters can be
+  verified (and later migrated). Hash comparisons are constant-time. Plaintext
+  passwords and hashes are never logged or persisted anywhere else.
+- **Randomness.** Salts and session tokens come from `esp_fill_random()` (the
+  ESP32-S3 hardware TRNG) behind an injectable `SecureRandom` interface; time
+  comes from `millis()` behind an injectable `TimeSource` so the core stays
+  host-testable.
+- **Credential persistence.** The credential verifier lives in a dedicated
+  LittleFS file `/guardian-x-admin.bin` (96-byte, padding-free record:
+  magic `GXA1`, format version, iterations, salt, hash, username, CRC32),
+  written atomically via a temporary file and rename. It is deliberately
+  separate from the DeviceCore snapshot: the snapshot is a byte-stable,
+  dual-slot migration format that is wiped by Phase 3 slot recovery, while
+  the credential needs independent erase-and-recover semantics and must not
+  be touched by Wi-Fi or slot-level snapshot recovery. A full LittleFS
+  reformat still erases both application data and credentials, after which
+  the administrator must be initialized again. Session tokens are not
+  persisted at all.
+- **Sessions.** Sessions are in-memory only: 256-bit tokens from the hardware
+  RNG, a fixed capacity of 4 slots, and a 30-minute absolute lifetime.
+  Expired slots are purged lazily and by `expireSessions()`; when all slots
+  are live, the session with the earliest expiry is evicted. `logout`
+  invalidates one token, `logoutAll` every token, and any password change
+  invalidates every session. A reboot invalidates all sessions because none
+  are persisted. Tokens are never logged.
+- **Authorization boundary.** Authentication is separate from authorization:
+  `authenticate()` proves an identity and returns a token, while
+  `authorize(token, &principal)` is the reusable fail-closed check that
+  Phase 5 HTTP routes must call per request (denied on any error, unknown or
+  expired token, or uninitialized core). It returns a minimal `Principal`
+  (username, session id, authentication time); there is no role-based access
+  control, and Wi-Fi connectivity, IP knowledge, or setup-AP access are never
+  treated as authentication.
+- **Recovery.** Lost credentials are recovered by design, not by guesswork:
+  the `A` serial command erases only the credential file and returns the
+  device to a clean uninitialized state, after which `a` can initialize a new
+  administrator. It never touches classes, students, guardians, palms, or
+  dismissal data. A corrupt credential record (bad CRC, bad magic, unsupported
+  version, or out-of-range parameters) is rejected at boot with
+  `kCorruptRecord` and can be erased the same way. The `f` factory reset now
+  explicitly clears both the network/provisioning state and the administrator
+  credential while preserving application data. Wi-Fi retries, router
+  outages, and repeated provisioning submissions never read or modify the
+  credential record.
+- **Threat model and known limitations.** The trust anchor is physical access
+  to the USB serial console: anyone holding the device can erase credentials
+  with `A`, so the model protects against network and setup-AP attackers, not
+  against an attacker with physical console access (this matches the device's
+  actual hardware, which has no reset button or secure element). The serial
+  console transmits passwords in cleartext over USB; the Phase 5 HTTP login
+  must use the session flow instead. Passwords are validated for length and
+  printability only — no complexity or dictionary policy. PBKDF2 parameters
+  have not been measured on-device; benchmark in Phase 10 before tuning.
+  Sessions are lost on reboot by design.
+- **Validation.** 26 native security tests plus the 12 existing Phase 2/3
+  regression tests pass against freshly compiled sources (MSVC host build;
+  PlatformIO's GCC-only native environment cannot compile mbedTLS on this
+  machine). A Phase 4-only ESP32-S3 firmware build succeeds with RAM 38.6 %
+  (126,552 B) and flash 24.6 % (823,269 B). **Hardware validation is not yet performed**:
+  serial admin setup, login timing, and recovery have not been exercised on a
+  connected device.
+
 ## Phase 5 — Local Web Server & API
 
 - **Objective:** Deliver a local HTTP interface over the validated core.
@@ -203,5 +285,5 @@ Dismissal approved or denied
 
 ## Current implementation boundary
 
-Phases 0–2 are implemented. Phases 3–10 remain planned and must not be
+Phases 0–4 are implemented. Phases 5–10 remain planned and must not be
 started automatically.

@@ -1,0 +1,32 @@
+# PlatformIO build and dependency output
+.pio/
+.pioenvs/
+.piolibdeps/
+
+# Other build output
+build/
+dist/
+
+# VS Code generated index and browsing data
+.vscode/ipch/
+.vscode/.browse.*
+
+# Local environment and secret files
+.env
+.env.*
+!.env.example
+secrets.*
+*.key
+
+# Temporary and editor files
+*.tmp
+*.temp
+*.bak
+*.swp
+*.swo
+*~
+
+# Operating-system files
+.DS_Store
+Thumbs.db
+Desktop.ini

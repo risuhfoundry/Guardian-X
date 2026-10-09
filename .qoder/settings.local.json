@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(pio run 2>&1 | tail -30)",
+      "Bash(ls \"$HOME/.platformio/penv/Scripts/\" 2>/dev/null | head -20; echo \"---\"; ls \"$USERPROFILE/.platformio/penv/Scripts/\" 2>/dev/null | head -20)"
+    ]
+  }
+}
